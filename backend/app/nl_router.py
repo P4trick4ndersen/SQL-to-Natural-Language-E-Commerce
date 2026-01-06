@@ -21,6 +21,11 @@ ALLOWED_TABLES = {
     "core.products",
     "core.customers",
     "staging.retail_raw",
+    "analytics.daily_revenue",
+    "analytics.weekly_revenue",
+    "analytics.country_revenue",
+    "analytics.product_revenue",
+    "analytics.customer_revenue",
 }
 
 MAX_LIMIT = 200
@@ -61,6 +66,10 @@ Rules:
 - Do NOT use INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/COPY/TRUNCATE.
 - Use schema-qualified names like analytics.invoice_summary
 - Prefer analytics.invoice_summary for revenue/order-level questions.
+- Prefer using analytics.daily_revenue / weekly_revenue / monthly_revenue for time-series revenue questions.
+- Prefer analytics.product_revenue for product ranking questions.
+- Prefer analytics.customer_revenue for customer spending questions.
+- Prefer analytics.country_revenue for country questions.
 
 Time grouping rules (IMPORTANT):
 - For day grouping, return a DATE column:
