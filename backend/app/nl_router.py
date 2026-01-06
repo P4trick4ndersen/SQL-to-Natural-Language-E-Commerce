@@ -1,58 +1,145 @@
 import os
-import json
+import re
+
 from openai import OpenAI
+import sqlglot
+from sqlglot import exp
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# --- OpenAI client ---
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY not found. Put it in backend/.env and restart uvicorn.")
 
-# Allowed intents -> SAFE SQL templates (no model-generated SQL)
-INTENTS = {
-    "monthly_revenue": {
-        "sql": """
-            SELECT month, revenue
-            FROM analytics.monthly_revenue
-            ORDER BY month
-            LIMIT %(limit)s;
-        """,
-        "defaults": {"limit": 12},
-    },
-    "revenue_in_month": {
-        "sql": """
-            SELECT month, revenue
-            FROM analytics.monthly_revenue
-            WHERE month = %(month)s::timestamp
-            LIMIT 1;
-        """,
-        "defaults": {"month": "2011-03-01 00:00:00"},
-    },
-    "top_countries": {
-        "sql": """
-            SELECT country, SUM(invoice_total) AS revenue
-            FROM analytics.invoice_summary
-            WHERE is_cancelled = FALSE
-            GROUP BY country
-            ORDER BY revenue DESC
-            LIMIT %(limit)s;
-        """,
-        "defaults": {"limit": 10},
-    },
+client = OpenAI(api_key=api_key)
+
+# --- Safeguards ---
+ALLOWED_TABLES = {
+    "analytics.invoice_summary",
+    "analytics.monthly_revenue",
+    "core.invoice_lines",
+    "core.invoices",
+    "core.products",
+    "core.customers",
+    "staging.retail_raw",
 }
 
-SYSTEM_PROMPT = f"""
-You are an intent classifier for analytics questions.
-Return ONLY valid JSON with keys: intent, params.
+MAX_LIMIT = 200
 
-Allowed intents: {list(INTENTS.keys())}
+SCHEMA_HINT = """
+Database objects you can query (Postgres):
+
+analytics.invoice_summary(
+  invoice_no, invoice_date, customer_id, country, is_cancelled, invoice_total
+)
+
+analytics.monthly_revenue(
+  month, revenue
+)
+
+core.invoices(
+  invoice_no, invoice_date, customer_id, country, is_cancelled
+)
+
+core.invoice_lines(
+  invoice_no, stock_code, quantity, unit_price, line_total
+)
+
+core.products(
+  stock_code, description
+)
+
+core.customers(
+  customer_id, country, first_seen, last_seen
+)
+
+staging.retail_raw(
+  invoice_no, stock_code, description, quantity, invoice_date, unit_price, customer_id, country
+)
 
 Rules:
-- If user asks for revenue by month, use "monthly_revenue".
-- If user asks for revenue in a specific month (e.g., March 2011), use "revenue_in_month"
-  and set params.month to "YYYY-MM-01 00:00:00".
-- If user asks about country revenue/top countries, use "top_countries".
-- Always include params (can be empty).
-- Never output SQL. Never output extra text.
+- Only generate a single SELECT query.
+- Do NOT use INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/COPY/TRUNCATE.
+- Use schema-qualified names like analytics.invoice_summary
+- Prefer analytics.invoice_summary for revenue/order-level questions.
+
+Time grouping rules (IMPORTANT):
+- For day grouping, return a DATE column:
+  * Use DATE_TRUNC('day', invoice_date)::date AS day  OR  invoice_date::date AS day
+- For week grouping, use DATE_TRUNC('week', invoice_date)::date AS week
+- For month grouping, use DATE_TRUNC('month', invoice_date)::date AS month
+- Avoid returning timestamps for time buckets unless the user explicitly asks for timestamps.
+
+- Always include a LIMIT (<= 200).
 """
 
-def classify_question(question: str) -> dict:
+SYSTEM_PROMPT = f"""
+You write safe PostgreSQL SELECT queries.
+
+{SCHEMA_HINT}
+
+Return ONLY the SQL query text. No markdown. No explanation.
+"""
+
+
+def _extract_table_refs(parsed: exp.Expression) -> set[str]:
+    tables = set()
+    for t in parsed.find_all(exp.Table):
+        name = t.name
+        schema = t.db
+        if schema:
+            tables.add(f"{schema}.{name}".lower())
+        else:
+            tables.add(name.lower())
+    return tables
+
+
+def validate_sql(sql: str) -> str:
+    sql = sql.strip().strip(";").strip()
+
+    banned = r"\b(insert|update|delete|drop|alter|create|truncate|copy|grant|revoke)\b"
+    if re.search(banned, sql, flags=re.IGNORECASE):
+        raise ValueError("Only SELECT queries are allowed.")
+
+    try:
+        parsed = sqlglot.parse_one(sql, read="postgres")
+    except Exception:
+        raise ValueError("SQL could not be parsed. Please rephrase your question.")
+
+    # Ensure it's SELECT (or contains a SELECT)
+    if not isinstance(parsed, exp.Select) and not parsed.find(exp.Select):
+        raise ValueError("Only SELECT queries are allowed.")
+
+    refs = _extract_table_refs(parsed)
+
+    # Require schema-qualified tables
+    for ref in refs:
+        if "." not in ref:
+            raise ValueError(
+                f"Use schema-qualified tables (e.g., analytics.invoice_summary). Found: {ref}"
+            )
+
+    # Whitelist tables/views
+    for ref in refs:
+        if ref not in ALLOWED_TABLES:
+            raise ValueError(f"Table/view not allowed: {ref}")
+
+    # Enforce LIMIT
+    limit_expr = parsed.args.get("limit")
+    if limit_expr is None:
+        sql = f"{sql}\nLIMIT {MAX_LIMIT}"
+    else:
+        # If LIMIT is present, require it be a simple integer and clamp
+        try:
+            n = int(limit_expr.expression.name)
+            if n > MAX_LIMIT:
+                sql = re.sub(r"(?i)\blimit\s+\d+\b", f"LIMIT {MAX_LIMIT}", sql)
+        except Exception:
+            raise ValueError("LIMIT must be a simple integer <= 200.")
+
+    return sql
+
+
+def generate_sql(question: str) -> str:
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0,
@@ -60,8 +147,7 @@ def classify_question(question: str) -> dict:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": question},
         ],
-        response_format={"type": "json_object"},
     )
 
-    content = resp.choices[0].message.content
-    return json.loads(content)
+    sql = resp.choices[0].message.content.strip()
+    return validate_sql(sql)

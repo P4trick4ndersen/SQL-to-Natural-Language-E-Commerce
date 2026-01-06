@@ -2,17 +2,44 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import os
 import psycopg
 
-from app.nl_router import classify_question, INTENTS
+from datetime import date, datetime
+from decimal import Decimal
 
+from app.nl_router import generate_sql
 
 app = FastAPI(title="SQL-to-Natural-Language E-Commerce API")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set. Check backend/.env")
+
+
+class NLQuery(BaseModel):
+    question: str
+
+
+def json_safe(value):
+    """Convert common Postgres/Python types into JSON-friendly values."""
+    if isinstance(value, datetime):
+        # If it's exactly midnight, return date-only string (nicer for charts)
+        if (
+            value.hour == 0 and value.minute == 0 and value.second == 0
+            and value.microsecond == 0
+        ):
+            return value.date().isoformat()
+        return value.isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    if isinstance(value, Decimal):
+        return float(value)
+
+    return value
 
 
 @app.get("/health")
@@ -37,33 +64,33 @@ def monthly_revenue(limit: int = 12):
 
 
 @app.post("/nl/query")
-def nl_query(payload: dict):
-    question = payload.get("question")
+def nl_query(payload: NLQuery):
+    question = payload.question.strip()
     if not question:
-        raise HTTPException(status_code=400, detail="Missing 'question'")
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    # 1) Model chooses intent + params
-    parsed = classify_question(question)
-    intent = parsed.get("intent")
-    params = parsed.get("params", {})
+    try:
+        sql = generate_sql(question)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    if intent not in INTENTS:
-        raise HTTPException(status_code=400, detail=f"Unsupported intent: {intent}")
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                cols = [d.name for d in cur.description]
 
-    # 2) Merge defaults with model params
-    merged_params = {**INTENTS[intent]["defaults"], **params}
-    sql = INTENTS[intent]["sql"]
+        json_rows = [
+            {cols[i]: json_safe(r[i]) for i in range(len(cols))}
+            for r in rows
+        ]
 
-    # 3) Run template SQL
-    with psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, merged_params)
-            rows = cur.fetchall()
-            cols = [d.name for d in cur.description]
-
-    return {
-        "question": question,
-        "intent": intent,
-        "params": merged_params,
-        "rows": [dict(zip(cols, r)) for r in rows],
-    }
+        return {
+            "question": question,
+            "sql": sql,
+            "columns": cols,
+            "rows": json_rows,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"SQL execution error: {e}")
