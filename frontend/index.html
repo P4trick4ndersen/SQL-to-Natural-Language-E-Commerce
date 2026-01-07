@@ -3,7 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Natural Language → SQL (E-Commerce)</title>
+  <title>Natural Language → SQL (Kaggle E-Commerce Dec 2010 to Sep 2011)</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
   <style>
     body { font-family: system-ui, Arial, sans-serif; max-width: 1100px; margin: 40px auto; padding: 0 16px; }
     h1 { margin-bottom: 6px; }
@@ -21,18 +24,20 @@
     .error { color: #b00020; white-space: pre-wrap; }
     .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; background: #f0f0f0; font-size: 12px; margin-right: 6px; }
     .examples button { margin-right: 8px; margin-top: 8px; }
+    .timing { margin-top: 8px; }
+    .chartwrap { height: 360px; }
   </style>
 </head>
 <body>
-  <h1>Natural Language → SQL (E-Commerce)</h1>
-  <p class="sub">Ask a question. The backend generates safe SQL and returns results.</p>
+  <h1>Natural Language → SQL (Kaggle E-Commerce Dec 2010 to Sep 2011)</h1>
+  <p class="sub">Ask a question. The backend generates corresponding SQL code and returns results.</p>
 
   <div class="card">
     <div class="muted">Examples:</div>
     <div class="examples">
       <button onclick="setQ('Daily revenue for December 2010')">Daily revenue (Dec 2010)</button>
+      <button onclick="setQ('Weekly revenue for 2011')">Weekly revenue (2011)</button>
       <button onclick="setQ('Top 10 products by revenue')">Top products</button>
-      <button onclick="setQ('Top 10 customers by revenue')">Top customers</button>
       <button onclick="setQ('Revenue by country (top 10)')">Revenue by country</button>
     </div>
 
@@ -40,6 +45,8 @@
     <br/>
     <button onclick="run()">Ask</button>
     <span id="status" class="pill" style="display:none;"></span>
+
+    <div class="timing muted" id="timing"></div>
   </div>
 
   <div class="row">
@@ -47,14 +54,24 @@
       <div class="muted">Generated SQL</div>
       <pre id="sql">(will appear here)</pre>
     </div>
+
     <div class="col card">
-      <div class="muted">Result</div>
-      <div id="result">(will appear here)</div>
+      <div class="muted">Chart</div>
+      <div class="chartwrap">
+        <canvas id="chart"></canvas>
+      </div>
+      <div class="muted" id="chartNote" style="margin-top:8px;"></div>
     </div>
+  </div>
+
+  <div class="card" style="margin-top:18px;">
+    <div class="muted">Result table</div>
+    <div id="result">(will appear here)</div>
   </div>
 
   <script>
     const API_URL = "http://127.0.0.1:8000";
+    let chart; // Chart.js instance
 
     function setQ(text) {
       document.getElementById("q").value = text;
@@ -68,8 +85,8 @@
 
     function renderTable(rows) {
       if (!rows || rows.length === 0) return "<div class='muted'>No rows returned.</div>";
-
       const cols = Object.keys(rows[0]);
+
       let html = "<div style='max-height:420px; overflow:auto; border-radius:8px;'>";
       html += "<table><thead><tr>";
       for (const c of cols) html += `<th>${c}</th>`;
@@ -84,10 +101,75 @@
       return html;
     }
 
+    function destroyChart() {
+      if (chart) {
+        chart.destroy();
+        chart = null;
+      }
+    }
+
+    function tryBuildSeries(rows) {
+      // Heuristics:
+      // - time series: first column looks like date/day/week/month and second column numeric
+      // - ranking: first column string-ish category and second column numeric
+      if (!rows || rows.length < 2) return null;
+      const cols = Object.keys(rows[0]);
+      if (cols.length < 2) return null;
+
+      const xKey = cols[0];
+      const yKey = cols[1];
+
+      const yVals = rows.map(r => r[yKey]).filter(v => typeof v === "number");
+      if (yVals.length < Math.floor(rows.length * 0.8)) return null; // mostly numeric required
+
+      const xVals = rows.map(r => String(r[xKey] ?? ""));
+      const looksDate = xVals.every(v => /^\d{4}-\d{2}-\d{2}/.test(v));
+
+      return { xKey, yKey, xVals, yVals, looksDate };
+    }
+
+    function renderChart(rows) {
+      destroyChart();
+      const note = document.getElementById("chartNote");
+
+      const series = tryBuildSeries(rows);
+      if (!series) {
+        note.textContent = "No chart: return at least 2 columns (category/date + numeric).";
+        return;
+      }
+
+      note.textContent = `Charting: ${series.xKey} vs ${series.yKey}`;
+
+      const ctx = document.getElementById("chart").getContext("2d");
+
+      chart = new Chart(ctx, {
+        type: series.looksDate ? "line" : "bar",
+        data: {
+          labels: series.xVals,
+          datasets: [{
+            label: series.yKey,
+            data: series.yVals,
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: true }
+          },
+          scales: {
+            x: { ticks: { maxRotation: 45, minRotation: 0 } }
+          }
+        }
+      });
+    }
+
     async function run() {
       const q = document.getElementById("q").value.trim();
       const sqlEl = document.getElementById("sql");
       const resultEl = document.getElementById("result");
+      const timingEl = document.getElementById("timing");
+      const chartNote = document.getElementById("chartNote");
 
       if (!q) {
         resultEl.innerHTML = "<div class='error'>Please enter a question.</div>";
@@ -95,8 +177,11 @@
       }
 
       setStatus("Loading...");
+      timingEl.textContent = "";
       sqlEl.textContent = "";
       resultEl.innerHTML = "<div class='muted'>Querying…</div>";
+      chartNote.textContent = "";
+      destroyChart();
 
       try {
         const res = await fetch(`${API_URL}/nl/query`, {
@@ -116,6 +201,13 @@
 
         sqlEl.textContent = data.sql || "(no sql returned)";
         resultEl.innerHTML = renderTable(data.rows);
+
+        const t = data.timing_ms;
+        if (t) {
+          timingEl.textContent = `Timing: SQL gen ${t.sql_generate}ms • DB ${t.db_query}ms • Total ${t.total}ms`;
+        }
+
+        renderChart(data.rows);
         setStatus(`Rows: ${(data.rows || []).length}`);
       } catch (e) {
         sqlEl.textContent = "";
